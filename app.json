@@ -1,16 +1,13 @@
 {
   "expo": {
-    "name": "test",
-    "slug": "test",
+    "name": "medical-robot-app-go",
+    "slug": "medical-robot-app-go",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "test",
+    "scheme": "medicalrobotappgo",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
-    "assetBundlePatterns": [
-      "assets/*"
-    ],
     "ios": {
       "supportsTablet": true
     },
@@ -41,9 +38,7 @@
             "backgroundColor": "#000000"
           }
         }
-      ],
-      "expo-asset",
-      "react-native-vision-camera"
+      ]
     ],
     "experiments": {
       "typedRoutes": true,
