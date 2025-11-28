@@ -1,6 +1,11 @@
+import { FontAwesome, Ionicons, MaterialIcons } from '@expo/vector-icons';
+import { Audio, InterruptionModeAndroid, InterruptionModeIOS } from 'expo-av';
+import * as FileSystem from 'expo-file-system/legacy'; // 또는 'expo-file-system' (버전에 맞게 사용)
 import { useLocalSearchParams } from 'expo-router';
+import * as Speech from 'expo-speech';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  Alert,
   FlatList,
   KeyboardAvoidingView,
   Modal,
@@ -10,14 +15,13 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  View,
+  View
 } from 'react-native';
-// 🎤 아이콘 추가 (FontAwesome)
-import { FontAwesome, Ionicons, MaterialIcons } from '@expo/vector-icons';
-import * as Speech from 'expo-speech';
 import { useSocket } from '../contexts/SocketContext';
 
-// --- [타입 정의] ---
+// --- [유틸리티] 지연 함수 ---
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 interface Message {
   id: string;
   sender: 'user' | 'bot' | 'system';
@@ -27,13 +31,7 @@ interface Message {
   isAnswered?: boolean;
 }
 
-interface CommandResponse {
-  type: 'simple' | 'confirm';
-  text: string;
-  action?: string;
-}
-
-// --- [컴포넌트] 로봇 얼굴 ---
+// --- 로봇 얼굴 컴포넌트 ---
 const RobotFace = ({ emotion, isSpeaking }: { emotion: string; isSpeaking: boolean }) => {
   const eyeColor = emotion === 'error' ? '#ff4d4d' : '#333';
   return (
@@ -54,25 +52,70 @@ export default function CommandScreen() {
   const user = { id: userId || 'guest', name: userName || '사용자' };
   const socket = useSocket();
 
-  // --- 상태 관리 ---
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
   const [robotStatus, setRobotStatus] = useState('대기 중');
   const [robotEmotion, setRobotEmotion] = useState<'happy' | 'listening' | 'thinking' | 'error'>('happy');
   const [isSpeaking, setIsSpeaking] = useState(false);
   
-  // 🎤 음성 녹음 상태 (UI용)
+  const [recording, setRecording] = useState<Audio.Recording | undefined>(undefined);
   const [isRecording, setIsRecording] = useState(false);
-  
   const [sosModalVisible, setSosModalVisible] = useState(false);
   const flatListRef = useRef<FlatList>(null);
 
-  // --- TTS 함수 ---
-  const speak = (text: string) => {
+  // --- 1. 듣기(TTS) 모드 설정: 스피커 강제 및 DuckOthers 사용 ---
+  const setModePlayback = async () => {
+    try {
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        staysActiveInBackground: true,
+        playsInSilentModeIOS: true,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false, // 스피커 강제
+        interruptionModeIOS: InterruptionModeIOS.DuckOthers, // [변경] DoNotMix -> DuckOthers
+        interruptionModeAndroid: InterruptionModeAndroid.DuckOthers,
+      });
+    } catch (e) {
+      console.log('Playback Mode Error:', e);
+    }
+  };
+
+  // --- 2. 녹음(Record) 모드 설정 ---
+  const setModeRecord = async () => {
+    try {
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        staysActiveInBackground: true,
+        playsInSilentModeIOS: true,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
+        interruptionModeIOS: InterruptionModeIOS.DuckOthers,
+        interruptionModeAndroid: InterruptionModeAndroid.DuckOthers,
+      });
+    } catch (e) {
+      console.log('Record Mode Error:', e);
+    }
+  };
+
+  useEffect(() => {
+    setModePlayback();
+  }, []);
+
+  // --- TTS 함수 (핵심 수정: 지연 및 모드 확실화) ---
+  const speak = async (text: string) => {
+    Speech.stop(); // 기존 음성 중단
+    
+    // 모드 재설정
+    await setModePlayback();
+    
+    // OS 오디오 라우팅 변경 대기 (소리가 작다면 이 값을 300~500으로 늘려보세요)
+    await delay(300); 
+
     setIsSpeaking(true);
     Speech.speak(text, {
       language: 'ko-KR',
       rate: 0.9,
+      pitch: 1.0,
       onDone: () => {
         setIsSpeaking(false);
         setRobotEmotion('happy');
@@ -89,29 +132,49 @@ export default function CommandScreen() {
     setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
   }, []);
 
+  // --- 소켓 및 초기 인사 ---
   useEffect(() => {
-    addMessage({ sender: 'bot', text: `${user.name}님, 무엇을 도와드릴까요?`, type: 'simple' });
-    speak(`${user.name}님, 무엇을 도와드릴까요?`);
+    setTimeout(() => {
+        addMessage({ sender: 'bot', text: `${user.name}님, 무엇을 도와드릴까요?`, type: 'simple' });
+        speak(`${user.name}님, 무엇을 도와드릴까요?`);
+    }, 800); // 초기 진입 시 안정화 시간 확보
 
     if (!socket) return;
 
-    const handleCommandResponse = (response: CommandResponse) => {
+    const handleUserSpeech = (data: { text: string }) => {
+      console.log("🎤 내 말 인식됨:", data.text);
+      addMessage({ sender: 'user', text: data.text, type: 'simple' });
+      setRobotStatus('생각 중...');
+      setRobotEmotion('thinking');
+    };
+
+    const handleCommandResponse = async (response: any) => {
+      console.log("📥 서버 응답:", response);
       setRobotStatus('대기 중');
       setRobotEmotion('happy');
+
+      if (response.recognized_text) {
+        addMessage({ sender: 'user', text: response.recognized_text, type: 'simple' });
+      } else if (response.meta && response.meta.recognized_text) {
+         addMessage({ sender: 'user', text: response.meta.recognized_text, type: 'simple' });
+      }
 
       addMessage({
         sender: 'bot',
         text: response.text,
         type: response.type,
-        actionCommand: response.action,
+        actionCommand: response.meta, 
         isAnswered: false,
       });
-      speak(response.text);
+
+      await speak(response.text);
     };
 
+    socket.on('user-speech', handleUserSpeech);
     socket.on('command-response', handleCommandResponse);
 
     return () => {
+      socket.off('user-speech', handleUserSpeech);
       socket.off('command-response', handleCommandResponse);
       Speech.stop();
     };
@@ -119,7 +182,6 @@ export default function CommandScreen() {
 
   const sendMessage = () => {
     if (inputText.trim().length === 0) return;
-
     addMessage({ sender: 'user', text: inputText, type: 'simple' });
     setRobotStatus('처리 중...');
     setRobotEmotion('thinking');
@@ -134,27 +196,88 @@ export default function CommandScreen() {
     setInputText('');
   };
 
-  // --- 🎤 음성 입력 시뮬레이션 핸들러 ---
-  const toggleListening = () => {
-    if (isRecording) {
-      // 녹음 중지
-      setIsRecording(false);
-      setRobotStatus('대기 중');
-      setRobotEmotion('happy');
-    } else {
-      // 녹음 시작
+  // --- 🎤 녹음 시작 ---
+  const startRecording = async () => {
+    try {
+      Speech.stop();
+      setIsSpeaking(false);
+
+      const permission = await Audio.requestPermissionsAsync();
+      if (permission.status !== 'granted') {
+        Alert.alert("권한 거부", "마이크 권한이 필요합니다.");
+        return;
+      }
+
+      await delay(100);
+      await setModeRecord();
+      await delay(100);
+
+      const { recording } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY
+      );
+
+      setRecording(recording);
       setIsRecording(true);
       setRobotStatus('듣고 있어요...');
-      setRobotEmotion('listening'); // 로봇이 귀를 기울임
+      setRobotEmotion('listening');
+    } catch (err) {
+      console.error("녹음 시작 실패", err);
+      setRobotStatus('오류 발생');
+      setRobotEmotion('error');
+    }
+  };
 
-      // [시뮬레이션] 2초 뒤에 가상의 텍스트 입력
-      setTimeout(() => {
-        // 실제로는 여기서 STT 라이브러리가 텍스트를 반환함
-        setInputText("오늘 날씨 알려줘"); 
-        setIsRecording(false);
-        setRobotStatus('대기 중');
-        setRobotEmotion('happy');
-      }, 2000);
+  // --- 🎤 녹음 종료 및 전송 (가장 중요한 해결 부분) ---
+  const stopRecordingAndSend = async () => {
+    setIsRecording(false);
+    setRobotStatus('처리 중...');
+    setRobotEmotion('thinking');
+    setRecording(undefined);
+
+    if (!recording) return;
+
+    try {
+      // 1. 녹음 중단 및 메모리 해제
+      await recording.stopAndUnloadAsync();
+      
+      // 2. 하드웨어 점유 해제 대기
+      await delay(200);
+
+      // [핵심 해결책] 3. 오디오 엔진을 리셋하여 수화부(통화모드)에서 스피커(미디어모드)로 강제 전환 유도
+      await Audio.setIsEnabledAsync(false);
+      await delay(50);
+      await Audio.setIsEnabledAsync(true);
+
+      // 4. 미디어 모드로 확실히 설정
+      await setModePlayback();
+      
+      // 5. 모드가 적용될 시간을 줌
+      await delay(300);
+
+      const uri = recording.getURI();
+
+      if (uri && socket) {
+        const base64String = await FileSystem.readAsStringAsync(uri, {
+          encoding: 'base64',
+        });
+        socket.emit('audio-upload', {
+          audioData: base64String,
+          format: 'm4a',
+          userId: user.id
+        });
+      }
+    } catch (error) {
+      console.error("전송 실패:", error);
+      setRobotStatus("전송 실패");
+      setRobotEmotion('error');
+    }
+  };
+
+  const handleMicPress = () => {
+    if (isRecording) {
+      stopRecordingAndSend();
+    } else {
+      startRecording();
     }
   };
 
@@ -194,11 +317,7 @@ export default function CommandScreen() {
 
   return (
     <SafeAreaView style={styles.container}>
-      <KeyboardAvoidingView
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        style={{ flex: 1 }}
-      >
-        {/* 헤더 */}
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={{ flex: 1 }}>
         <View style={styles.header}>
           <View style={styles.headerLeft}>
             <RobotFace emotion={robotEmotion} isSpeaking={isSpeaking} />
@@ -209,17 +328,12 @@ export default function CommandScreen() {
               </Text>
             </View>
           </View>
-          <TouchableOpacity 
-            style={styles.sosButton} 
-            onPress={handleSOSRequest}
-            activeOpacity={0.7}
-          >
+          <TouchableOpacity style={styles.sosButton} onPress={handleSOSRequest} activeOpacity={0.7}>
             <MaterialIcons name="phone-in-talk" size={32} color="white" />
             <Text style={styles.sosText}>SOS</Text>
           </TouchableOpacity>
         </View>
 
-        {/* 채팅 영역 */}
         <FlatList
           ref={flatListRef}
           data={messages}
@@ -240,19 +354,12 @@ export default function CommandScreen() {
                   {item.text}
                 </Text>
               </View>
-
               {item.sender === 'bot' && item.type === 'confirm' && !item.isAnswered && (
                 <View style={styles.buttonGroup}>
-                  <TouchableOpacity
-                    style={[styles.actionBtn, styles.yesBtn]}
-                    onPress={() => handleConfirmAction(item.id, item.actionCommand || '', true)}
-                  >
+                  <TouchableOpacity style={[styles.actionBtn, styles.yesBtn]} onPress={() => handleConfirmAction(item.id, item.actionCommand || '', true)}>
                     <Text style={styles.actionBtnText}>네</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.actionBtn, styles.noBtn]}
-                    onPress={() => handleConfirmAction(item.id, item.actionCommand || '', false)}
-                  >
+                  <TouchableOpacity style={[styles.actionBtn, styles.noBtn]} onPress={() => handleConfirmAction(item.id, item.actionCommand || '', false)}>
                     <Text style={[styles.actionBtnText, { color: '#333' }]}>아니오</Text>
                   </TouchableOpacity>
                 </View>
@@ -262,40 +369,25 @@ export default function CommandScreen() {
           style={styles.chatArea}
         />
 
-        {/* --- 🎤 수정된 입력 영역 --- */}
         <View style={styles.inputContainer}>
-          {/* 마이크 버튼 */}
-          <TouchableOpacity
-            style={[styles.micButton, isRecording && styles.micButtonRecording]}
-            onPress={toggleListening}
-          >
-            <FontAwesome name="microphone" size={24} color="white" />
+          <TouchableOpacity style={[styles.micButton, isRecording && styles.micButtonRecording]} onPress={handleMicPress}>
+            <FontAwesome name={isRecording ? "stop" : "microphone"} size={24} color="white" />
           </TouchableOpacity>
-
           <TextInput
             style={styles.input}
             value={inputText}
             onChangeText={setInputText}
-            placeholder={isRecording ? "듣고 있어요..." : "명령 입력..."}
+            placeholder={isRecording ? "듣고 있어요..." : "메시지 입력..."}
             placeholderTextColor="#999"
             onSubmitEditing={sendMessage}
+            editable={!isRecording}
           />
-          <TouchableOpacity 
-            style={[styles.sendButton, !inputText.trim() && styles.sendButtonDisabled]} 
-            onPress={sendMessage}
-            disabled={!inputText.trim()}
-          >
+          <TouchableOpacity style={[styles.sendButton, !inputText.trim() && styles.sendButtonDisabled]} onPress={sendMessage} disabled={!inputText.trim()}>
             <Ionicons name="send" size={24} color="white" />
           </TouchableOpacity>
         </View>
 
-        {/* SOS 모달 */}
-        <Modal
-          animationType="fade"
-          transparent={true}
-          visible={sosModalVisible}
-          onRequestClose={cancelSOS}
-        >
+        <Modal animationType="fade" transparent={true} visible={sosModalVisible} onRequestClose={cancelSOS}>
           <View style={styles.modalOverlay}>
             <View style={styles.modalContent}>
               <MaterialIcons name="campaign" size={60} color="#dc2626" />
@@ -312,7 +404,6 @@ export default function CommandScreen() {
             </View>
           </View>
         </Modal>
-
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
@@ -320,8 +411,6 @@ export default function CommandScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#f8f9fa' },
-  
-  // 헤더
   header: { 
     flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
     paddingHorizontal: 20, paddingVertical: 15, backgroundColor: 'white', 
@@ -332,8 +421,6 @@ const styles = StyleSheet.create({
   headerTitle: { fontSize: 20, fontWeight: 'bold', color: '#111' },
   headerStatus: { fontSize: 16, color: '#0ea5e9', fontWeight: '600' },
   statusEmergency: { color: '#dc2626', fontWeight: 'bold' },
-
-  // 로봇 얼굴
   robotFaceContainer: { marginRight: 15 },
   robotHead: {
     width: 60, height: 60, backgroundColor: '#e0f2fe', borderRadius: 30,
@@ -345,16 +432,12 @@ const styles = StyleSheet.create({
   eyeBlinking: { opacity: 0.5 },
   mouth: { width: 20, height: 4, borderRadius: 2, backgroundColor: '#333' },
   mouthHappy: { height: 8, borderBottomLeftRadius: 10, borderBottomRightRadius: 10, backgroundColor: 'transparent', borderWidth: 2, borderTopWidth: 0, borderColor: '#333' },
-
-  // SOS 버튼
   sosButton: {
     backgroundColor: '#dc2626', width: 70, height: 70, borderRadius: 35,
     justifyContent: 'center', alignItems: 'center',
     shadowColor: "#dc2626", shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.3, shadowRadius: 5, elevation: 5,
   },
   sosText: { color: 'white', fontWeight: 'bold', marginTop: 2, fontSize: 12 },
-
-  // 채팅 영역
   chatArea: { flex: 1, backgroundColor: '#f0f2f5' },
   chatContent: { padding: 15, paddingBottom: 20 },
   messageBubble: {
@@ -368,8 +451,6 @@ const styles = StyleSheet.create({
   userText: { color: 'white' },
   botText: { color: '#1f2937' },
   systemText: { color: '#991b1b', fontWeight: 'bold', textAlign: 'center' },
-
-  // B타입 버튼
   buttonGroup: { flexDirection: 'row', marginTop: 8, marginLeft: 4, gap: 10, justifyContent: 'flex-start' },
   actionBtn: {
     paddingVertical: 12, paddingHorizontal: 25, borderRadius: 15, elevation: 3, minWidth: 80, alignItems: 'center',
@@ -378,22 +459,16 @@ const styles = StyleSheet.create({
   yesBtn: { backgroundColor: '#3b82f6' },
   noBtn: { backgroundColor: '#f3f4f6', borderWidth: 1, borderColor: '#d1d5db' },
   actionBtnText: { fontSize: 18, fontWeight: 'bold', color: 'white' },
-
-  // --- 🎤 입력창 스타일 (수정됨) ---
   inputContainer: {
     flexDirection: 'row', alignItems: 'center', padding: 15,
     backgroundColor: 'white', borderTopWidth: 1, borderColor: '#e5e7eb',
   },
   micButton: {
     width: 56, height: 56, borderRadius: 28,
-    backgroundColor: '#9ca3af', // 평소 회색
-    justifyContent: 'center', alignItems: 'center',
-    marginRight: 10,
-    elevation: 2,
+    backgroundColor: '#9ca3af', justifyContent: 'center', alignItems: 'center', marginRight: 10, elevation: 2,
   },
   micButtonRecording: {
-    backgroundColor: '#ef4444', // 녹음 중 빨간색
-    borderWidth: 3, borderColor: '#fecaca',
+    backgroundColor: '#ef4444', borderWidth: 3, borderColor: '#fecaca',
   },
   input: {
     flex: 1, height: 56, borderColor: '#d1d5db', borderWidth: 2, borderRadius: 28,
@@ -404,8 +479,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center', alignItems: 'center', elevation: 2,
   },
   sendButtonDisabled: { backgroundColor: '#9ca3af' },
-
-  // 모달
   modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', alignItems: 'center' },
   modalContent: { width: '85%', backgroundColor: 'white', borderRadius: 24, padding: 30, alignItems: 'center', elevation: 10 },
   modalTitle: { fontSize: 28, fontWeight: 'bold', color: '#dc2626', marginVertical: 10 },

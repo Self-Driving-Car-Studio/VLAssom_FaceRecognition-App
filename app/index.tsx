@@ -1,10 +1,14 @@
-import { MaterialCommunityIcons } from '@expo/vector-icons'; // 아이콘 사용을 위해 추가
+import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useIsFocused } from '@react-navigation/native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { router } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { useSocket } from '../contexts/SocketContext';
+
+// TTS 및 오디오 제어를 위한 라이브러리
+import { Audio, InterruptionModeAndroid, InterruptionModeIOS } from 'expo-av';
+import * as Speech from 'expo-speech';
 
 // User 타입 정의
 interface User {
@@ -14,13 +18,34 @@ interface User {
 
 export default function AuthScreen() {
   const [permission, requestPermission] = useCameraPermissions();
-  const [statusMessage, setStatusMessage] = useState('얼굴 인식으로 로그인');
-  const [isScanning, setIsScanning] = useState(false); // 스캔 중인지 상태 표시
+  const [statusMessage, setStatusMessage] = useState('로그인 버튼을 눌러주세요'); // 초기 메시지 변경
+  const [isScanning, setIsScanning] = useState(false);
 
   const socket = useSocket();
   const cameraRef = useRef<CameraView>(null);
   const intervalRef = useRef<number | null>(null);
   const isFocused = useIsFocused();
+
+  // 스피커 모드 강제 설정 함수
+  const setAudioToSpeaker = async () => {
+    try {
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        staysActiveInBackground: true,
+        playsInSilentModeIOS: true,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
+        interruptionModeIOS: InterruptionModeIOS.DoNotMix,
+        interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
+      });
+    } catch (error) {
+      console.log('오디오 모드 설정 실패:', error);
+    }
+  };
+
+  useEffect(() => {
+    setAudioToSpeaker();
+  }, []);
 
   useEffect(() => {
     if (!permission?.granted) {
@@ -31,84 +56,94 @@ export default function AuthScreen() {
   useEffect(() => {
     if (!socket) return;
 
-    const handleAuthSuccess = (user: User) => {
+    const handleAuthSuccess = async (user: User) => {
       console.log('인증 성공:', user.name);
-      setStatusMessage(`${user.name}님, 환영합니다.`);
-      setIsScanning(false);
+      const successText = `${user.name}님, 환영합니다.`;
       
-      stopStreaming(); // 성공 시 촬영 중단
+      setStatusMessage(successText);
+      setIsScanning(false);
+      stopStreaming();
+
+      await setAudioToSpeaker();
+
+      Speech.speak(successText, {
+        language: 'ko-KR',
+        pitch: 1.0,
+        rate: 1.0,
+      });
 
       setTimeout(() => {
         router.replace({
           pathname: '/command',
           params: { userId: user.id, userName: user.name },
         });
-      }, 1000);
+      }, 3000);
     };
 
     const handleAuthFail = () => {
-      // 실패해도 계속 시도하거나, 메시지만 변경
-      console.log('인증 실패');
+      console.log('인증 실패 - 다시 시도 중...');
+      // 실패해도 계속 스캔하거나, 메시지만 업데이트 할 수 있습니다.
     };
 
     socket.on('auth-success', handleAuthSuccess);
     socket.on('auth-fail', handleAuthFail);
 
-    // 화면에 들어왔을 때 권한이 있다면 자동으로 시작 (원치 않으면 이 부분 주석 처리하고 버튼 클릭으로만 작동하게 변경 가능)
-    if (isFocused && permission?.granted) {
-      startStreaming();
-    }
+    // [변경됨] 화면 진입 시 자동 시작 로직(startStreaming) 제거됨
 
     return () => {
       stopStreaming();
       socket.off('auth-success', handleAuthSuccess);
       socket.off('auth-fail', handleAuthFail);
+      Speech.stop();
     };
-  }, [socket, isFocused, permission]);
+  }, [socket, isFocused]); // permission 의존성 제거 (버튼 클릭 시 체크하므로)
 
   const stopStreaming = () => {
     if (intervalRef.current) {
       clearInterval(intervalRef.current);
       intervalRef.current = null;
     }
+    setIsScanning(false);
   };
 
   const startStreaming = () => {
-    if (intervalRef.current) return; // 이미 실행 중이면 중복 실행 방지
+    if (intervalRef.current) return;
     
     setIsScanning(true);
     setStatusMessage('사용자를 확인하고 있습니다...');
 
-    intervalRef.current = window.setInterval(async () => {
+    // 즉시 한 번 실행 후 인터벌 시작 (반응 속도 향상)
+    const captureAndSend = async () => {
       if (cameraRef.current) {
         try {
-          // --- [로그 1] ---
-          console.log("--- 1. 찰칵 시도 (백그라운드) ---");
-
           const photo = await cameraRef.current.takePictureAsync({
             quality: 0.2,
             base64: true,
             skipProcessing: true,
-            shutterSound: false, // 찰칵 소리 제거 (지원되는 기기에서만 동작)
+            shutterSound: false,
           });
 
           if (photo && photo.base64) {
-            console.log(`--- 2. 사진 촬영 성공 (크기: ${photo.base64.length}) ---`);
             socket?.emit('identify-face', photo.base64);
           } 
         } catch (error) {
-          console.log('--- ‼️ 스냅샷 오류 ---', error);
+          console.log('--- 스냅샷 오류 ---', error);
         }
       }
-    }, 3000); // 3초 간격 (너무 빠르면 과부하가 올 수 있어 조정)
+    };
+
+    captureAndSend(); // 첫 클릭 즉시 실행
+    intervalRef.current = window.setInterval(captureAndSend, 3000);
   };
 
-  // 버튼을 눌렀을 때 수동으로 다시 시작하는 함수
   const handleLoginPress = () => {
     if (!permission?.granted) {
       requestPermission();
       return;
     }
+    // 이미 스캔 중이면 중단할지, 아니면 무시할지 결정 (여기선 재시작 방지)
+    if (isScanning) return;
+    
     startStreaming();
   };
 
@@ -118,10 +153,6 @@ export default function AuthScreen() {
 
   return (
     <View style={styles.container}>
-      {/* [핵심 수정 사항] 
-        카메라를 숨기기 위해 width: 1, height: 1, opacity: 0으로 설정합니다.
-        display: 'none'을 하면 촬영이 안 될 수 있습니다.
-      */}
       {permission.granted && (
         <CameraView
           ref={cameraRef}
@@ -131,10 +162,9 @@ export default function AuthScreen() {
         />
       )}
 
-      {/* UI 영역 */}
       <View style={styles.contentContainer}>
         
-        {/* 로고 영역 */}
+        {/* 로고 영역: flex: 1을 주어 중앙을 차지하게 함 */}
         <View style={styles.logoWrapper}>
           <View style={styles.logoIconContainer}>
             <MaterialCommunityIcons name="robot" size={60} color="white" />
@@ -143,21 +173,26 @@ export default function AuthScreen() {
           <Text style={styles.logoSubtitle}>로봇 도우미</Text>
         </View>
 
-        {/* 버튼 영역 */}
+        {/* 버튼 영역: 하단에 고정 */}
         <View style={styles.buttonWrapper}>
           <TouchableOpacity 
-            style={styles.loginButton} 
+            style={[styles.loginButton, isScanning && styles.loginButtonActive]} 
             onPress={handleLoginPress}
             activeOpacity={0.8}
+            disabled={isScanning} // 스캔 중 중복 클릭 방지
           >
             {isScanning ? (
-               // 스캔 중일 때 보여줄 아이콘/텍스트 (선택 사항)
                <MaterialCommunityIcons name="face-recognition" size={24} color="rgba(255,255,255,0.7)" style={styles.btnIcon} />
             ) : (
                <MaterialCommunityIcons name="face-recognition" size={24} color="white" style={styles.btnIcon} />
             )}
-            <Text style={styles.loginButtonText}>{statusMessage}</Text>
+            <Text style={styles.loginButtonText}>
+              {isScanning ? '인식 중...' : '로그인'}
+            </Text>
           </TouchableOpacity>
+
+          {/* 상태 메시지를 버튼 아래에 표시하거나 버튼 텍스트로 사용 */}
+          <Text style={styles.statusText}>{statusMessage}</Text>
 
           <TouchableOpacity style={styles.subButton}>
             <Text style={styles.subButtonText}>다른 방법으로 로그인</Text>
@@ -172,9 +207,8 @@ export default function AuthScreen() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#FFFFFF', // 전체 배경 흰색
+    backgroundColor: '#FFFFFF',
   },
-  // 카메라를 시각적으로 숨김 (기능은 유지)
   hiddenCamera: {
     position: 'absolute',
     width: 1,
@@ -184,25 +218,24 @@ const styles = StyleSheet.create({
   },
   contentContainer: {
     flex: 1,
-    justifyContent: 'space-between',
-    paddingVertical: 80, // 상하 여백
+    // justifyContent: 'space-between' 제거 -> Flex 비율로 제어
     paddingHorizontal: 30,
-    alignItems: 'center',
+    paddingBottom: 50, // 하단 여백
   },
-  // 로고 섹션 스타일
   logoWrapper: {
+    flex: 1, // 화면의 남은 공간을 모두 차지하여 수직 중앙 정렬 효과
+    justifyContent: 'center',
     alignItems: 'center',
-    marginTop: 50,
+    marginTop: 0, // 기존 margin 제거
   },
   logoIconContainer: {
-    width: 100,
-    height: 100,
-    backgroundColor: '#0056b3', // 파란색 배경
-    borderRadius: 25,
+    width: 120, // 크기 살짝 키움
+    height: 120,
+    backgroundColor: '#0056b3',
+    borderRadius: 30,
     justifyContent: 'center',
     alignItems: 'center',
     marginBottom: 20,
-    // 그림자 효과
     shadowColor: "#000",
     shadowOffset: {
       width: 0,
@@ -221,22 +254,22 @@ const styles = StyleSheet.create({
   logoSubtitle: {
     fontSize: 20,
     fontWeight: '600',
-    color: '#333',
+    color: '#555',
   },
-  // 버튼 섹션 스타일
   buttonWrapper: {
     width: '100%',
     alignItems: 'center',
+    justifyContent: 'flex-end', // 하단 정렬
   },
   loginButton: {
-    backgroundColor: '#0056b3', // 버튼 파란색
+    backgroundColor: '#0056b3',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     width: '100%',
     height: 60,
     borderRadius: 15,
-    marginBottom: 20,
+    marginBottom: 15,
     shadowColor: "#000",
     shadowOffset: {
       width: 0,
@@ -246,6 +279,9 @@ const styles = StyleSheet.create({
     shadowRadius: 3.84,
     elevation: 5,
   },
+  loginButtonActive: {
+    backgroundColor: '#004494', // 눌렸을 때 색상 약간 변경
+  },
   btnIcon: {
     marginRight: 10,
   },
@@ -254,12 +290,17 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: 'bold',
   },
+  statusText: {
+    color: '#666',
+    marginBottom: 20,
+    fontSize: 18,
+  },
   subButton: {
     padding: 10,
   },
   subButtonText: {
-    color: '#555',
-    fontSize: 16,
-    textDecorationLine: 'underline', // 밑줄 (선택사항)
+    color: '#888',
+    fontSize: 14,
+    textDecorationLine: 'underline',
   },
 });
