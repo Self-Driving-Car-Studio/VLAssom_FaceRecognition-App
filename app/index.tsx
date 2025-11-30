@@ -1,6 +1,7 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { useIsFocused } from '@react-navigation/native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
+import * as ImageManipulator from 'expo-image-manipulator';
 import { router } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
 import { StyleSheet, Text, TouchableOpacity, View } from 'react-native';
@@ -30,7 +31,7 @@ const TRANSLATIONS = {
     ttsLocale: 'ko-KR',
   },
   en: {
-    title: 'Blossom',
+    title: 'VLAssom',
     subtitle: 'Robot Assistant',
     loginBtn: 'Login',
     loginBtnScanning: 'Scanning...',
@@ -51,6 +52,9 @@ interface User {
 }
 
 export default function AuthScreen() {
+  // [로그] 컴포넌트 렌더링 확인
+  console.log('[AuthScreen] Rendering...');
+
   const [permission, requestPermission] = useCameraPermissions();
   
   // [상태] 언어 설정 ('ko' | 'en')
@@ -59,16 +63,11 @@ export default function AuthScreen() {
   // 현재 언어 팩 가져오기
   const t = TRANSLATIONS[language];
 
-  // 상태 메시지는 언어 변경에 따라 동적으로 보여주기 위해
-  // 고정된 문자열 state보다는 '상태 코드'나 현재 상태를 기반으로 렌더링하는 것이 좋으나,
-  // 기존 구조 유지를 위해, 커스텀 메시지(예: 환영인사)가 없을 때만 t.statusIdle 등을 사용하도록 함.
   const [customStatusMessage, setCustomStatusMessage] = useState<string | null>(null);
-  
   const [isScanning, setIsScanning] = useState(false);
 
   const socket = useSocket();
   const cameraRef = useRef<CameraView>(null);
-  // React Native 환경 호환성을 위해 window.setInterval 대신 NodeJS.Timeout 타입 사용
   const intervalRef = useRef<any>(null);
   const isFocused = useIsFocused();
   
@@ -76,6 +75,7 @@ export default function AuthScreen() {
 
   // 1. 오디오 모드 설정
   const setAudioToSpeaker = async () => {
+    console.log('[Audio] Setting audio mode to speaker...');
     try {
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: false,
@@ -86,13 +86,16 @@ export default function AuthScreen() {
         interruptionModeIOS: InterruptionModeIOS.DoNotMix,
         interruptionModeAndroid: InterruptionModeAndroid.DoNotMix,
       });
+      console.log('[Audio] Audio mode set successfully.');
     } catch (error) {
-      console.log('오디오 모드 설정 실패:', error);
+      console.error('[Audio] 오디오 모드 설정 실패:', error);
     }
   };
 
   // 2. 초기화
   useEffect(() => {
+    console.log('[AuthScreen] Mounted via useEffect.');
+
     const initAudio = async () => {
       await setAudioToSpeaker();
       try {
@@ -101,14 +104,16 @@ export default function AuthScreen() {
           { shouldPlay: false, volume: 0 }
         );
         silentSoundRef.current = sound;
+        console.log('[Audio] Silent sound loaded.');
       } catch (error) {
-        console.log('[Audio] 무음 파일 로드 실패', error);
+        console.error('[Audio] 무음 파일 로드 실패', error);
       }
     };
 
     initAudio();
 
     return () => {
+      console.log('[AuthScreen] Unmounting... Cleanup triggered.');
       if (silentSoundRef.current) {
         silentSoundRef.current.unloadAsync();
       }
@@ -118,138 +123,172 @@ export default function AuthScreen() {
 
   // 3. 카메라 권한 체크
   useEffect(() => {
+    console.log(`[Camera] Permission Status: ${permission?.status}, Granted: ${permission?.granted}`);
     if (!permission?.granted) {
+      console.log('[Camera] Requesting permission...');
       requestPermission();
     }
   }, [permission, requestPermission]);
 
-  // 4. 소켓 이벤트 및 인증 성공 로직 (language 의존성 추가)
+  // 4. 소켓 이벤트 및 인증 성공 로직
   useEffect(() => {
-    if (!socket) return;
+    if (!socket) {
+      console.warn('[Socket] Socket instance is null.');
+      return;
+    }
+
+    console.log(`[Socket] Listener Setup (Lang: ${language})`);
 
     const handleAuthSuccess = async (user: User) => {
-      console.log('인증 성공:', user.name);
+      console.log('✅ [Socket] Auth Success Received:', user);
       
-      // 상태 정리
       setIsScanning(false);
       stopStreaming();
       
-      // 현재 언어 기준으로 환영 메시지 생성
       const welcomeText = TRANSLATIONS[language].welcomeMsg(user.name);
+      console.log(`[Auth] Welcome message generated: "${welcomeText}"`);
       setCustomStatusMessage(welcomeText);
 
       await setAudioToSpeaker();
 
-      // 스피커 예열
       try {
         if (silentSoundRef.current) {
+          console.log('[Audio] Replaying silent sound (Speaker Kick)...');
           await silentSoundRef.current.replayAsync();
         }
         await delay(800); 
       } catch (e) {
-        console.log('Audio Kick Failed', e);
+        console.error('[Audio] Audio Kick Failed', e);
       }
 
-      // TTS 실행 (현재 언어 설정 반영)
-      // 앞부분 쉼표 추가로 TTS 씹힘 방지
       const speechText = `, , ${welcomeText}`;
+      console.log(`[TTS] Speaking: "${speechText}" (Locale: ${TRANSLATIONS[language].ttsLocale})`);
       
       Speech.speak(speechText, {
-        language: TRANSLATIONS[language].ttsLocale, // 언어 코드 동적 적용
+        language: TRANSLATIONS[language].ttsLocale,
         pitch: 1.0,
         rate: 1.0,
+        onStart: () => console.log('[TTS] Started speaking.'),
         onDone: () => {
-           // [수정] 언어 설정(lang)을 파라미터로 함께 전달
+           console.log('[TTS] Finished speaking. Navigating to /command...');
            router.replace({
             pathname: '/command',
             params: { userId: user.id, userName: user.name, lang: language },
           });
-        }
+        },
+        onError: (e) => console.error('[TTS] Error:', e)
       });
     };
 
     const handleAuthFail = () => {
-      console.log('인증 실패 - 다시 시도 중...');
+      console.log('❌ [Socket] Auth Fail Received. Retrying...');
     };
 
     socket.on('auth-success', handleAuthSuccess);
     socket.on('auth-fail', handleAuthFail);
 
     return () => {
+      console.log('[Socket] Cleaning up listeners.');
       stopStreaming();
       socket.off('auth-success', handleAuthSuccess);
       socket.off('auth-fail', handleAuthFail);
       Speech.stop();
     };
-  }, [socket, isFocused, language]); // language가 바뀌면 핸들러도 최신 state(언어)를 알 수 있게 재등록
+  }, [socket, isFocused, language]);
 
   // 5. 카메라 스트리밍 제어
   const stopStreaming = () => {
+    console.log('[Stream] Stopping streaming...');
     if (intervalRef.current) {
       clearInterval(intervalRef.current);
       intervalRef.current = null;
     }
     setIsScanning(false);
-    setCustomStatusMessage(null); // 스캔 중단 시 커스텀 메시지 초기화
+    setCustomStatusMessage(null);
   };
 
   const startStreaming = () => {
-    if (intervalRef.current) return;
+    if (intervalRef.current) {
+      console.log('[Stream] Already streaming. Ignoring request.');
+      return;
+    }
     
+    console.log('[Stream] Starting streaming...');
     setIsScanning(true);
-    setCustomStatusMessage(null); // 스캔 시작하면 상태 메시지는 자동(t.statusScanning)으로 전환
+    setCustomStatusMessage(null);
 
     const captureAndSend = async () => {
-      if (cameraRef.current) {
-        try {
-          const photo = await cameraRef.current.takePictureAsync({
-            quality: 0.3,
-            base64: true,
-            skipProcessing: true,
-            shutterSound: false,
+  if (cameraRef.current) {
+    try {
+      // 1. 일단 사진을 찍습니다 (base64는 여기서 받지 않음 -> 메모리 절약)
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: 0.5, // 여기서 quality는 크게 의미 없음, 리사이징때 조절
+        skipProcessing: true,
+        shutterSound: false,
+      });
+
+      if (photo?.uri) {
+        // 2. 이미지 리사이징 및 압축 (가로 500px로 줄임)
+        // 얼굴 인식용으로는 500px도 충분히 고화질입니다.
+        const manipulated = await ImageManipulator.manipulateAsync(
+          photo.uri,
+          [{ resize: { width: 500 } }], // 가로 500px로 리사이징 (세로는 비율 유지)
+          { compress: 0.5, format: ImageManipulator.SaveFormat.JPEG, base64: true } // 압축률 0.5 & Base64 변환
+        );
+
+        if (manipulated.base64) {
+          // 로그로 줄어든 용량 확인 (아마 50kb ~ 100kb 수준으로 줄어들 것임)
+          console.log(`[Socket] Emitting 'identify-face' (Original: ~5MB -> Resized: ${manipulated.base64.length}, Lang: ${language})`);
+          
+          socket?.emit('identify-face', {
+            image: manipulated.base64,
+            lang: language
           });
-
-          if (photo && photo.base64) {
-
-            // [수정 후] 객체 형태로 이미지와 언어를 함께 전송 ✅
-            socket?.emit('identify-face', {
-                image: photo.base64,
-                lang: language // 현재 선택된 언어 state ('ko' or 'en')
-            });
-          } 
-        } catch (error) {
-          console.log('--- 스냅샷 오류 ---', error);
         }
       }
-    };
-
+    } catch (error) {
+      console.log('--- 스냅샷/리사이징 오류 ---', error);
+    }
+  }
+};
+    
     captureAndSend();
-    // window.setInterval 대신 전역 setInterval 사용 (RN 호환)
     intervalRef.current = setInterval(captureAndSend, 1500);
   };
 
   const handleLoginPress = () => {
+    console.log('[UI] Login Button Pressed');
     if (!permission?.granted) {
+      console.log('[UI] Permission not granted, requesting...');
       requestPermission();
       return;
     }
-    if (isScanning) return;
+    if (isScanning) {
+        console.log('[UI] Already scanning. Ignoring press.');
+        return;
+    }
     
     if (silentSoundRef.current) {
-        silentSoundRef.current.replayAsync().catch(() => {});
+        silentSoundRef.current.replayAsync().catch((e) => console.log('[Audio] Replay ignore:', e));
     }
 
     startStreaming();
   };
 
+  const handleLanguageChange = (lang: LanguageType) => {
+    console.log(`[UI] Language changed to: ${lang}`);
+    setLanguage(lang);
+  };
+
   // 현재 상태에 따른 메시지 결정 함수
   const getDisplayStatusMessage = () => {
-    if (customStatusMessage) return customStatusMessage; // 로그인 성공 등 특별 메시지
-    if (isScanning) return t.statusScanning;             // 스캔 중 메시지
-    return t.statusIdle;                                 // 대기 중 메시지
+    if (customStatusMessage) return customStatusMessage;
+    if (isScanning) return t.statusScanning;
+    return t.statusIdle;
   };
 
   if (!permission) {
+    console.log('[Render] Waiting for permission status...');
     return <View style={styles.container} />;
   }
 
@@ -264,17 +303,17 @@ export default function AuthScreen() {
         />
       )}
 
-      {/* [추가] 언어 선택 버튼 영역 */}
+      {/* 언어 선택 버튼 영역 */}
       <View style={styles.langSwitchContainer}>
         <TouchableOpacity 
-          onPress={() => setLanguage('ko')}
+          onPress={() => handleLanguageChange('ko')}
           style={[styles.langButton, language === 'ko' && styles.langButtonActive]}
         >
           <Text style={[styles.langText, language === 'ko' && styles.langTextActive]}>KOR</Text>
         </TouchableOpacity>
         <View style={styles.langDivider} />
         <TouchableOpacity 
-          onPress={() => setLanguage('en')}
+          onPress={() => handleLanguageChange('en')}
           style={[styles.langButton, language === 'en' && styles.langButtonActive]}
         >
           <Text style={[styles.langText, language === 'en' && styles.langTextActive]}>ENG</Text>
@@ -327,7 +366,6 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#FFFFFF',
   },
-  // [추가] 언어 스위처 스타일
   langSwitchContainer: {
     position: 'absolute',
     top: 50,
